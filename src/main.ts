@@ -6,6 +6,12 @@ import * as express from 'express';
 
 const server = express();
 
+const defaultCorsOrigins = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://localhost:5174',
+];
+
 export const createNestApp = async () => {
   const app = await NestFactory.create(AppModule, new ExpressAdapter(server));
 
@@ -19,15 +25,21 @@ export const createNestApp = async () => {
   }
 
   app.enableCors({
-    origin: ['https://frontend-for-patient-registration-a.vercel.app', 'http://localhost:5173', 'http://localhost:3000','http://localhost:5174','https://healsync360.vercel.app'],
+    origin: (process.env.CORS_ORIGINS ?? defaultCorsOrigins.join(','))
+      .split(',')
+      .map((origin) => origin.trim())
+      .filter(Boolean),
     credentials: true,
   });
   app.useGlobalPipes(new ValidationPipe());
-  await app.listen(process.env.PORT ?? 4000,'0.0.0.0',() => {
-    Logger.log(`Server is running on port ${process.env.PORT ?? 4000}`, 'Bootstrap');
+  await app.listen(process.env.PORT ?? 4000, '0.0.0.0', () => {
+    Logger.log(
+      `Server is running on port ${process.env.PORT ?? 4000}`,
+      'Bootstrap',
+    );
   });
   await app.init();
-}
+};
 
 createNestApp();
 
