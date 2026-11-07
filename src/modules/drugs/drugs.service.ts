@@ -1,11 +1,42 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, PipelineStage } from 'mongoose';
-import { Drugs } from 'src/schema/drugs.schema';
+import { Drugs, normalizeDrugSearchText } from '../../schema/drugs.schema';
+
+const MAX_SEARCH_CANDIDATES_PER_FIELD = 100;
 
 @Injectable()
-export class DrugsService {
+export class DrugsService implements OnModuleInit {
+  private readonly logger = new Logger(DrugsService.name);
+
   constructor(@InjectModel('Drugs') private DrugModel: Model<Drugs>) {}
+
+  async onModuleInit(): Promise<void> {
+    const result = await this.DrugModel.updateMany(
+      {
+        $or: [
+          { nameNormalized: { $exists: false } },
+          { contentNormalized: { $exists: false } },
+          { companyNormalized: { $exists: false } },
+        ],
+      },
+      [
+        {
+          $set: {
+            nameNormalized: this.normalizedField('$name'),
+            contentNormalized: this.normalizedField('$content'),
+            companyNormalized: this.normalizedField('$company'),
+          },
+        },
+      ],
+    ).exec();
+
+    if (result.modifiedCount > 0) {
+      this.logger.log(
+        `Backfilled search fields for ${result.modifiedCount} drug records`,
+      );
+    }
+  }
 
   async getDrugsByName(name: string) {
     if (!name || name.trim().length < 2) return [];
@@ -16,172 +47,96 @@ export class DrugsService {
     const q = trimmedName.replace(/^tab(?:let)?\.?\s+/i, '').trim();
     if (q.length < 2) return [];
 
-    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const qNormalized = q.toLowerCase().replace(/[-\s]/g, '');
+    const qNormalized = normalizeDrugSearchText(q);
+    const escapedNormalized = qNormalized.replace(
+      /[.*+?^${}()|[\]\\]/g,
+      '\\$&',
+    );
     const qLower = q.toLowerCase();
 
+    const prefixMatch = (field: string) => ({
+      $match: { [field]: { $regex: `^${escapedNormalized}` } },
+    });
+    const candidateLimit = { $limit: MAX_SEARCH_CANDIDATES_PER_FIELD };
+
     const pipeline: PipelineStage[] = [
-      // Step 1: normalize text and broad candidate filter
+      // Bound each indexed prefix scan before relevance scoring and sorting.
+      prefixMatch('nameNormalized') as PipelineStage.Match,
+      candidateLimit as PipelineStage.Limit,
       {
-        $addFields: {
-          nameNormalized: {
-            $replaceAll: {
-              input: { $toLower: '$name' },
-              find: '-',
-              replacement: '',
-            },
-          },
-          contentNormalized: {
-            $replaceAll: {
-              input: { $toLower: '$content' },
-              find: '-',
-              replacement: '',
-            },
-          },
-          companyNormalized: {
-            $replaceAll: {
-              input: { $toLower: '$company' },
-              find: '-',
-              replacement: '',
-            },
-          },
-        },
-      } as PipelineStage.AddFields,
-      {
-        $match: {
-          $or: [
-            { nameNormalized: { $regex: qNormalized, $options: 'i' } },
-            { contentNormalized: { $regex: qNormalized, $options: 'i' } },
-            { companyNormalized: { $regex: qNormalized, $options: 'i' } },
-            { name: { $regex: escaped, $options: 'i' } },
-            { content: { $regex: escaped, $options: 'i' } },
-            { company: { $regex: escaped, $options: 'i' } },
+        $unionWith: {
+          coll: this.DrugModel.collection.name,
+          pipeline: [
+            prefixMatch('contentNormalized') as PipelineStage.Match,
+            candidateLimit as PipelineStage.Limit,
           ],
         },
-      } as PipelineStage.Match,
+      } as PipelineStage.UnionWith,
+      {
+        $unionWith: {
+          coll: this.DrugModel.collection.name,
+          pipeline: [
+            prefixMatch('companyNormalized') as PipelineStage.Match,
+            candidateLimit as PipelineStage.Limit,
+          ],
+        },
+      } as PipelineStage.UnionWith,
+      {
+        $group: {
+          _id: '$_id',
+          drug: { $first: '$$ROOT' },
+        },
+      } as PipelineStage.Group,
+      {
+        $replaceRoot: { newRoot: '$drug' },
+      } as PipelineStage.ReplaceRoot,
 
-      // Step 2: compute relevance score
+      // Score only indexed prefix matches before ranking the results.
       {
         $addFields: {
           _score: {
-            $let: {
-              vars: { nameLower: { $toLower: '$name' } },
-              in: {
-                $add: [
-                  // +10 exact name match
-                  { $cond: [{ $eq: ['$$nameLower', qLower] }, 10, 0] },
-                  // +9 normalized exact name match (ignores dashes/spaces)
+            $add: [
+              {
+                $cond: [{ $eq: [{ $toLower: '$name' }, qLower] }, 10, 0],
+              },
+              { $cond: [{ $eq: ['$nameNormalized', qNormalized] }, 9, 0] },
+              {
+                $cond: [
                   {
-                    $cond: [
-                      {
-                        $eq: [
-                          {
-                            $replaceAll: {
-                              input: { $toLower: '$name' },
-                              find: '-',
-                              replacement: '',
-                            },
-                          },
-                          qNormalized,
-                        ],
-                      },
-                      9,
-                      0,
-                    ],
+                    $regexMatch: {
+                      input: '$nameNormalized',
+                      regex: `^${escapedNormalized}`,
+                    },
                   },
-                  // +8 name starts with query
-                  {
-                    $cond: [
-                      {
-                        $regexMatch: {
-                          input: '$$nameLower',
-                          regex: `^${escaped}`,
-                          options: 'i',
-                        },
-                      },
-                      8,
-                      0,
-                    ],
-                  },
-                  // +6 a word in name starts with query  e.g. "Nise Plus"
-                  {
-                    $cond: [
-                      {
-                        $regexMatch: {
-                          input: '$$nameLower',
-                          regex: `(^|\\s)${escaped}`,
-                          options: 'i',
-                        },
-                      },
-                      6,
-                      0,
-                    ],
-                  },
-                  // +5 normalized word-prefix match
-                  {
-                    $cond: [
-                      {
-                        $regexMatch: {
-                          input: {
-                            $replaceAll: {
-                              input: { $toLower: '$name' },
-                              find: '-',
-                              replacement: '',
-                            },
-                          },
-                          regex: `^${qNormalized}`,
-                          options: 'i',
-                        },
-                      },
-                      5,
-                      0,
-                    ],
-                  },
-                  // +4 name contains query anywhere  e.g. "Biozenises" → only 4 pts
-                  {
-                    $cond: [
-                      {
-                        $regexMatch: {
-                          input: '$$nameLower',
-                          regex: escaped,
-                          options: 'i',
-                        },
-                      },
-                      4,
-                      0,
-                    ],
-                  },
-                  // +2 content match
-                  {
-                    $cond: [
-                      {
-                        $regexMatch: {
-                          input: { $toLower: '$content' },
-                          regex: escaped,
-                          options: 'i',
-                        },
-                      },
-                      2,
-                      0,
-                    ],
-                  },
-                  // +1 company match
-                  {
-                    $cond: [
-                      {
-                        $regexMatch: {
-                          input: { $toLower: '$company' },
-                          regex: escaped,
-                          options: 'i',
-                        },
-                      },
-                      1,
-                      0,
-                    ],
-                  },
+                  8,
+                  0,
                 ],
               },
-            },
+              {
+                $cond: [
+                  {
+                    $regexMatch: {
+                      input: '$contentNormalized',
+                      regex: `^${escapedNormalized}`,
+                    },
+                  },
+                  2,
+                  0,
+                ],
+              },
+              {
+                $cond: [
+                  {
+                    $regexMatch: {
+                      input: '$companyNormalized',
+                      regex: `^${escapedNormalized}`,
+                    },
+                  },
+                  1,
+                  0,
+                ],
+              },
+            ],
           },
         },
       } as PipelineStage.AddFields,
@@ -208,5 +163,15 @@ export class DrugsService {
     ];
 
     return this.DrugModel.aggregate(pipeline).exec();
+  }
+
+  private normalizedField(field: string) {
+    return {
+      $replaceAll: {
+        input: { $toLower: { $ifNull: [field, ''] } },
+        find: '-',
+        replacement: '',
+      },
+    };
   }
 }
