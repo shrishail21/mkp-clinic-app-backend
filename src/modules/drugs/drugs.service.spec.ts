@@ -10,12 +10,16 @@ type DrugAggregateMock = (pipeline: PipelineStage[]) => {
 describe('DurgsService', () => {
   let service: DrugsService;
   let aggregateMock: jest.MockedFunction<DrugAggregateMock>;
+  let updateManyMock: jest.Mock;
 
   beforeEach(async () => {
     aggregateMock = jest.fn<
       ReturnType<DrugAggregateMock>,
       Parameters<DrugAggregateMock>
     >();
+    updateManyMock = jest.fn().mockReturnValue({
+      exec: jest.fn().mockResolvedValue({ modifiedCount: 0 }),
+    });
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -24,6 +28,8 @@ describe('DurgsService', () => {
           provide: getModelToken('Drugs'),
           useValue: {
             aggregate: aggregateMock,
+            updateMany: updateManyMock,
+            collection: { name: 'drugs' },
           },
         },
       ],
@@ -36,24 +42,53 @@ describe('DurgsService', () => {
     expect(service).toBeDefined();
   });
 
-  it('should normalize hyphenated names when matching a query without dashes', async () => {
+  it('should bound indexed prefix candidates before scoring them', async () => {
     aggregateMock.mockReturnValue({ exec: jest.fn().mockResolvedValue([]) });
 
     await service.getDrugsByName('paracetamol');
 
     const pipeline = aggregateMock.mock.calls[0][0];
-    const addFieldsStage = pipeline.find(
-      (stage): stage is PipelineStage.AddFields => '$addFields' in stage,
-    );
-    const matchStage = pipeline.find(
-      (stage): stage is PipelineStage.Match => '$match' in stage,
-    );
+    const matchFields = [
+      (pipeline[0] as PipelineStage.Match).$match,
+      ...pipeline
+        .filter(
+          (stage): stage is PipelineStage.UnionWith => '$unionWith' in stage,
+        )
+        .map((stage) => stage.$unionWith)
+        .filter(
+          (union): union is Exclude<typeof union, string> =>
+            typeof union !== 'string',
+        )
+        .map((union) => union.pipeline?.[0])
+        .filter(
+          (stage): stage is PipelineStage.Match => !!stage && '$match' in stage,
+        )
+        .map((stage) => stage.$match),
+    ];
 
-    expect(addFieldsStage?.$addFields).toHaveProperty('nameNormalized');
-    expect(addFieldsStage?.$addFields).toHaveProperty('contentNormalized');
-    expect(addFieldsStage?.$addFields).toHaveProperty('companyNormalized');
-    expect(matchStage?.$match.$or).toContainEqual({
-      nameNormalized: { $regex: 'paracetamol', $options: 'i' },
+    expect(matchFields).toEqual([
+      { nameNormalized: { $regex: '^paracetamol' } },
+      { contentNormalized: { $regex: '^paracetamol' } },
+      { companyNormalized: { $regex: '^paracetamol' } },
+    ]);
+    expect(pipeline[1]).toEqual({ $limit: 100 });
+    expect(pipeline[2]).toMatchObject({
+      $unionWith: {
+        coll: 'drugs',
+        pipeline: [
+          { $match: { contentNormalized: { $regex: '^paracetamol' } } },
+          { $limit: 100 },
+        ],
+      },
+    });
+    expect(pipeline[3]).toMatchObject({
+      $unionWith: {
+        coll: 'drugs',
+        pipeline: [
+          { $match: { companyNormalized: { $regex: '^paracetamol' } } },
+          { $limit: 100 },
+        ],
+      },
     });
   });
 
@@ -65,15 +100,51 @@ describe('DurgsService', () => {
       await service.getDrugsByName(query);
 
       const pipeline = aggregateMock.mock.calls[0][0];
-      const matchStage = pipeline.find(
-        (stage): stage is PipelineStage.Match => '$match' in stage,
-      );
-
-      expect(matchStage?.$match.$or).toContainEqual({
-        nameNormalized: { $regex: 'paracetamol', $options: 'i' },
+      expect((pipeline[0] as PipelineStage.Match).$match).toEqual({
+        nameNormalized: { $regex: '^paracetamol' },
       });
     },
   );
+
+  it('should escape regex characters in a prefix query', async () => {
+    aggregateMock.mockReturnValue({ exec: jest.fn().mockResolvedValue([]) });
+
+    await service.getDrugsByName('C++');
+
+    const matchStage = aggregateMock.mock.calls[0][0][0] as PipelineStage.Match;
+    expect(matchStage.$match).toEqual({
+      nameNormalized: { $regex: '^c\\+\\+' },
+    });
+  });
+
+  it('should backfill normalized fields for existing records at startup', async () => {
+    await service.onModuleInit();
+
+    expect(updateManyMock).toHaveBeenCalledWith(
+      {
+        $or: [
+          { nameNormalized: { $exists: false } },
+          { contentNormalized: { $exists: false } },
+          { companyNormalized: { $exists: false } },
+        ],
+      },
+      [
+        {
+          $set: {
+            nameNormalized: expect.objectContaining({
+              $replaceAll: expect.any(Object),
+            }),
+            contentNormalized: expect.objectContaining({
+              $replaceAll: expect.any(Object),
+            }),
+            companyNormalized: expect.objectContaining({
+              $replaceAll: expect.any(Object),
+            }),
+          },
+        },
+      ],
+    );
+  });
 
   it('should not search when only a tablet label is provided', async () => {
     await expect(service.getDrugsByName('Tab ')).resolves.toEqual([]);
