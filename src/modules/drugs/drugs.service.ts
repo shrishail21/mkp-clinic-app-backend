@@ -2,6 +2,7 @@ import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model, PipelineStage } from 'mongoose';
 import { Drugs, normalizeDrugSearchText } from '../../schema/drugs.schema';
+import { CreateDrugDto } from '../../dto/create-drug.dto';
 
 const MAX_SEARCH_CANDIDATES_PER_FIELD = 100;
 
@@ -10,6 +11,14 @@ export class DrugsService implements OnModuleInit {
   private readonly logger = new Logger(DrugsService.name);
 
   constructor(@InjectModel('Drugs') private DrugModel: Model<Drugs>) {}
+
+  async createDrug(drugData: CreateDrugDto) {
+    return this.DrugModel.create({
+      name: drugData.name.trim(),
+      content: drugData.content.trim(),
+      company: drugData.company.trim(),
+    });
+  }
 
   async onModuleInit(): Promise<void> {
     const result = await this.DrugModel.updateMany(

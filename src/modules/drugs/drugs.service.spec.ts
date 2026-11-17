@@ -11,6 +11,7 @@ describe('DurgsService', () => {
   let service: DrugsService;
   let aggregateMock: jest.MockedFunction<DrugAggregateMock>;
   let updateManyMock: jest.Mock;
+  let createMock: jest.Mock;
 
   beforeEach(async () => {
     aggregateMock = jest.fn<
@@ -20,6 +21,7 @@ describe('DurgsService', () => {
     updateManyMock = jest.fn().mockReturnValue({
       exec: jest.fn().mockResolvedValue({ modifiedCount: 0 }),
     });
+    createMock = jest.fn();
 
     const module: TestingModule = await Test.createTestingModule({
       providers: [
@@ -29,6 +31,7 @@ describe('DurgsService', () => {
           useValue: {
             aggregate: aggregateMock,
             updateMany: updateManyMock,
+            create: createMock,
             collection: { name: 'drugs' },
           },
         },
@@ -40,6 +43,24 @@ describe('DurgsService', () => {
 
   it('should be defined', () => {
     expect(service).toBeDefined();
+  });
+
+  it('should trim drug fields before saving', async () => {
+    const drugData = {
+      name: ' Paracetamol ',
+      content: ' 500 mg ',
+      company: ' Example Pharma ',
+    };
+    const createdDrug = { _id: 'drug-id' };
+    createMock.mockResolvedValue(createdDrug);
+
+    await expect(service.createDrug(drugData)).resolves.toBe(createdDrug);
+
+    expect(createMock).toHaveBeenCalledWith({
+      name: 'Paracetamol',
+      content: '500 mg',
+      company: 'Example Pharma',
+    });
   });
 
   it('should bound indexed prefix candidates before scoring them', async () => {
