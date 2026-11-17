@@ -2,13 +2,7 @@
 /dist
 /node_modules
 /build
-/performance/gatling/target
-/performance/gatling/src/test/resources/doctors.csv
-/performance/gatling/src/test/resources/doctor-tokens-*.csv
-/performance/gatling/src/test/resources/clinic-admin-tokens-*.csv
-/performance/gatling/src/test/resources/clinic-admin-credentials-*.csv
-/performance/gatling/generated
-package-lock.json
+/performance/*
 
 # Logs
 logs
